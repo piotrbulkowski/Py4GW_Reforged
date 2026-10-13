@@ -206,7 +206,9 @@ barradin_coordinate_list_two = [(21932, 12966),(20720, 13561),(19394, 13174),(18
 def StartBot():
     global bot_vars, start_time
     bot_vars.bot_started = True
-    start_time = time.time()  
+    start_time = time.time()
+    # Baseline for the "farmed" column: items gained since START was pressed.
+    inventory_tracker.initialize()
 
 def StopBot():
     global bot_vars
@@ -2953,18 +2955,8 @@ class InventoryTracker:
         }
 
     def initialize(self):
-        self.initial_quantities = {}
-        try:
-            bags_to_check = ItemArray.CreateBagList(1, 2, 3, 4)  
-            item_array = ItemArray.GetItemArray(bags_to_check)
-
-            for item_id in item_array:
-                model_id = Item.GetModelID(item_id)
-                if model_id in self.tracked_model_ids: 
-                    quantity = Item.Properties.GetQuantity(item_id)
-                    self.initial_quantities[model_id] = self.get_count_items().get(model_id, 0)
-        except Exception as e:
-            PySystem.Console.Log("INVENTORY TRACKER", f"Error initializing: {e}", PySystem.Console.MessageType.Warning)
+        # One bag scan; get_count_items already logs its own errors.
+        self.initial_quantities = self.get_count_items()
 
     def get_count_items(self):
         count_items = {model_id: 0 for model_id in self.tracked_model_ids}
@@ -2982,22 +2974,14 @@ class InventoryTracker:
 
         return count_items
 
-    def get_farmed_items(self):
-        farmed_items = {model_id: 0 for model_id in self.tracked_model_ids}  
-        try:
-            bags_to_check = ItemArray.CreateBagList(1, 2, 3, 4)
-            item_array = ItemArray.GetItemArray(bags_to_check)
-
-            for item_id in item_array:
-                model_id = Item.GetModelID(item_id)
-                if model_id in self.tracked_model_ids:  
-                    initial_quantity = self.initial_quantities.get(model_id, 0)
-                    current_quantity = self.get_count_items().get(model_id, 0)
-                    farmed_items[model_id] = max(0, current_quantity - initial_quantity)  
-        except Exception as e:
-            PySystem.Console.Log("INVENTORY TRACKER", f"Error getting farmed items: {e}", PySystem.Console.MessageType.Warning)
-
-        return farmed_items
+    def get_farmed_items(self, count_items=None):
+        # One bag scan (or reuse the caller's) instead of one full rescan per tracked stack.
+        if count_items is None:
+            count_items = self.get_count_items()
+        return {
+            model_id: max(0, count_items.get(model_id, 0) - self.initial_quantities.get(model_id, 0))
+            for model_id in self.tracked_model_ids
+        }
 
 inventory_tracker = InventoryTracker()
 
@@ -3005,8 +2989,8 @@ def show_info_table_item():
     try:
         headers = ["ITEM NAME", "FARMED ITEMS / (COUNT)"] 
 
-        farmed_items = inventory_tracker.get_farmed_items()  
         count_items = inventory_tracker.get_count_items()
+        farmed_items = inventory_tracker.get_farmed_items(count_items)
 
         data = []
         
@@ -3262,8 +3246,6 @@ def main():
 
         if IsBotStarted():
 
-            inventory_tracker.get_farmed_items()  
-            
             # LEVEL 2-10
             if state.radio_button_selected == 0:  
                 if FSM_vars.state_machine_lvl2_10.is_finished():
@@ -3536,9 +3518,7 @@ def main():
                     ResetEnvironment()
                     StopBot()
                 else:
-                    FSM_vars.state_machine_necro_noreq.update()  
-        if not IsBotStarted():
-            inventory_tracker.initialize()
+                    FSM_vars.state_machine_necro_noreq.update()
 
     except ImportError as e:
         PySystem.Console.Log(bot_vars.window_module.module_name, f"ImportError encountered: {str(e)}", PySystem.Console.MessageType.Error)
