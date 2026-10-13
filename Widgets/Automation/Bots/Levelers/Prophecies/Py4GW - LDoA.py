@@ -4,6 +4,8 @@ import traceback
 from Py4GWCoreLib import Key,  Map, ImGui, Botting, ActionQueue, Agent
 from Py4GWCoreLib.Builds.Any.HeroAI import HeroAI_Build
 from Py4GWCoreLib.HeroAI.cache_data import CacheData
+from Py4GWCoreLib.FrameTree import Frame, FrameId
+from Py4GWCoreLib import ActionQueueManager
 from Py4GWCoreLib.enums_src.Region_enums import ServerRegion
 
 
@@ -1070,6 +1072,11 @@ HAMNET_EXIT_RETRY_MS = 30000      # re-walk the exit path if the zone line was m
 HAMNET_PATH_TIMEOUT_MS = 240000   # walking the bandit route (two groups)
 HAMNET_FIGHT_TIMEOUT_MS = 180000  # reaching the last checkpoint and clearing it
 HAMNET_CLEAR_CONFIRM_MS = 3000    # area must stay empty this long before the run ends
+# Reconnect attempts back off exponentially: 10 s after the popup appears, then 20 s, 40 s, 60 s (cap), ...
+HAMNET_RECONNECT_BACKOFF_BASE_MS = 10000
+HAMNET_RECONNECT_BACKOFF_MAX_MS = 60000
+HAMNET_MAX_RECONNECT_CLICKS = 10  # give up (stop the bot) after this many reconnect attempts
+HAMNET_RECONNECT_TIMEOUT_MS = 120000  # game not back this long after the last click -> stop
 HAMNET_MAX_EMPTY_RUNS = 2         # consecutive runs without enemies -> quest not active
 HAMNET_RESIGN_TIMEOUT_MS = 20000  # give up on /resign and map travel instead
 HAMNET_LOOT_RANGE = 1200          # drops picked up while walking the bandit route
@@ -1085,6 +1092,7 @@ hamnet_state_timer = Timer()
 hamnet_action_timer = Timer()  # throttles /resign and return-to-outpost requests
 hamnet_loot_timer = Timer()    # time spent on the current pickup
 hamnet_clear_timer = Timer()   # how long the last checkpoint has been free of enemies
+hamnet_reconnect_timer = Timer()  # time since the last click on the reconnect popup
 
 def hamnet_log(message, message_type=PySystem.Console.MessageType.Info):
     PySystem.Console.Log(module_name, f"[HAMNET] {message}", message_type)
@@ -1304,6 +1312,100 @@ def hamnet_end_of_run():
     if FSM_vars.hamnet_empty_runs >= HAMNET_MAX_EMPTY_RUNS:
         hamnet_log("No bandits on consecutive runs - is the Farmer Hamnet quest active? Stopping.", PySystem.Console.MessageType.Error)
         StopBot()
+
+# Child code -> frame hash of the "A network error has caused you to disconnect. Would you like
+# to attempt to reconnect?" popup (Game -> 10), confirmed live: 1 = TxtMessage, 3 = BtnYes,
+# 4 = BtnNo. Matched inside the popup rather than via the generic BtnYes label key, which any
+# Yes/No dialog carries.
+HAMNET_RECONNECT_POPUP_FINGERPRINT = {1: 329735997, 3: 1398610279, 4: 3600335809}
+hamnet_reconnect_last_mismatch = None
+
+def hamnet_find_reconnect_yes_button():
+    """Yes button of the network-error reconnect popup, or None.
+    Identified by structure + hashes only. Do NOT read the message with Frame.text(): on this
+    popup it crashed Gw.exe (native wcslen on a non-text frame, access violation at 0x5a)."""
+    global hamnet_reconnect_last_mismatch
+    popup = Frame(FrameId.ScreenFrame.DidNotCleaningDisconnectPopupCharselect)
+    if not popup.exists:
+        return None
+    for code, frame_hash in HAMNET_RECONNECT_POPUP_FINGERPRINT.items():
+        child = popup.find_child(code)
+        if child is None or child.hash != frame_hash:
+            # Diagnostic, logged once per distinct layout: snapshot codes/hashes only (no native text reads).
+            seen = {c: (popup.find_child(c).hash if popup.find_child(c) is not None else None) for c in popup.child_codes()}
+            if seen != hamnet_reconnect_last_mismatch:
+                hamnet_reconnect_last_mismatch = seen
+                hamnet_log(f"Frame at the reconnect popup slot does not match: child code -> hash {seen}", PySystem.Console.MessageType.Warning)
+            return None
+    yes_button = popup.find_child(3)
+    if yes_button is None or not yes_button.is_usable:
+        if hamnet_reconnect_last_mismatch != "yes-not-usable":
+            hamnet_reconnect_last_mismatch = "yes-not-usable"
+            hamnet_log("Reconnect popup found, but its Yes button is not usable yet.", PySystem.Console.MessageType.Warning)
+        return None
+    return yes_button
+
+def hamnet_restart_after_reconnect():
+    """The game is back after a reconnect: abandon the interrupted run and start a new one."""
+    FSM_vars.hamnet_reconnecting = False
+    in_explorable = Map.IsExplorable()
+    ResetEnvironment()
+    FSM_vars.hamnet_seen_enemies = True  # an interrupted run is not an "empty" (quest missing) run
+    if in_explorable:
+        hamnet_log("Reconnected in the explorable area - resigning and starting the run again.")
+        FSM_vars.state_machine_lvl11_20.jump_to_state_by_name("RESIGN AND RETURN TO FOIBLE'S FAIR")
+    else:
+        hamnet_log("Reconnected in an outpost - starting the run again.")
+        FSM_vars.hamnet_needs_portal_entry = True  # spawn spot after a reconnect is unknown
+
+def hamnet_handle_disconnect():
+    """Network-error recovery; runs before the map-ready guard. Returns True while the bot must
+    not act (reconnect popup shown, or waiting for the game to come back)."""
+    yes_button = hamnet_find_reconnect_yes_button()
+    if yes_button is not None:
+        if not FSM_vars.hamnet_reconnecting:
+            hamnet_log("Disconnected by a network error - attempting to reconnect.", PySystem.Console.MessageType.Warning)
+            FSM_vars.hamnet_reconnecting = True
+            FSM_vars.hamnet_reconnect_clicks = 0
+            hamnet_reconnect_timer.Start()  # attempts are timed from detection / the previous attempt
+            ActionQueueManager().ResetQueue("ACTION")  # drop moves/casts queued before the disconnect
+        attempt_delay = min(HAMNET_RECONNECT_BACKOFF_BASE_MS * (2 ** FSM_vars.hamnet_reconnect_clicks), HAMNET_RECONNECT_BACKOFF_MAX_MS)
+        if hamnet_reconnect_timer.HasElapsed(attempt_delay):
+            if FSM_vars.hamnet_reconnect_clicks >= HAMNET_MAX_RECONNECT_CLICKS:
+                hamnet_log("Reconnect keeps failing - stopping the bot.", PySystem.Console.MessageType.Error)
+                FSM_vars.hamnet_reconnecting = False
+                StopBot()
+                return True
+            FSM_vars.hamnet_reconnect_clicks += 1
+            # Alternate a UI-level click with an Enter keypress: a frame click on this modal was seen
+            # not to register live, while a real click on Yes works. Enter is only sent while the
+            # popup is confirmed on screen, otherwise it would open the chat box.
+            if FSM_vars.hamnet_reconnect_clicks % 2 == 1:
+                hamnet_log(f"Clicking Yes on the reconnect popup ({FSM_vars.hamnet_reconnect_clicks}/{HAMNET_MAX_RECONNECT_CLICKS}).")
+                # The library's own confirm dialogs (UIManager SalvageOptionsWindow.SelectOption)
+                # follow button_click with mouse action 8.
+                yes_button.click()
+                yes_button.mouse_action(8)
+            else:
+                hamnet_log(f"Pressing Enter on the reconnect popup ({FSM_vars.hamnet_reconnect_clicks}/{HAMNET_MAX_RECONNECT_CLICKS}).")
+                Keystroke.PressAndRelease(Key.Enter.value)
+            hamnet_reconnect_timer.Start()
+        return True
+
+    if not FSM_vars.hamnet_reconnecting:
+        return False
+
+    # Grace period: right after the click the old map can still report "ready" before the reload starts.
+    game_back = Map.IsMapReady() and Player.GetAgentID() > 0 and Party.IsPartyLoaded()
+    if game_back and hamnet_reconnect_timer.HasElapsed(5000):
+        hamnet_restart_after_reconnect()
+        return False
+
+    if hamnet_reconnect_timer.HasElapsed(HAMNET_RECONNECT_TIMEOUT_MS):
+        hamnet_log("The game did not come back after reconnecting - stopping the bot.", PySystem.Console.MessageType.Error)
+        FSM_vars.hamnet_reconnecting = False
+        StopBot()
+    return True
 
 def handle_npc_interaction():
     global FSM_vars
@@ -1904,6 +2006,8 @@ class StateMachineVars:
         self.hamnet_loot_agent = 0        # item agent currently being picked up
         self.hamnet_loot_last_interact = 0.0
         self.hamnet_loot_skipped = set()  # item agents given up on this run
+        self.hamnet_reconnecting = False  # a network-error reconnect is in progress
+        self.hamnet_reconnect_clicks = 0
         self.wizards_folly_to_foible_pathing = Routines.Movement.PathHandler(wizards_folly_to_foible_coordinate_list)
         # The final fight walks (back) to the last bandit checkpoint before it may end.
         self.hamnet_final_checkpoint_pathing = Routines.Movement.PathHandler(bandit_coordinate_list[-1:])
@@ -3487,6 +3591,14 @@ def DrawWindow():
 def main():
     global bot_vars, FSM_vars, inventory_tracker
     try:
+        # Network-error reconnect (Farmer Hamnet loop) must run before the readiness guard below:
+        # while disconnected the map is not ready, so nothing after it would execute.
+        try:
+            if IsBotStarted() and state.radio_button_selected == 1 and hamnet_handle_disconnect():
+                return
+        except Exception as e:
+            PySystem.Console.Log(bot_vars.window_module.module_name, f"Reconnect handling error: {e}", PySystem.Console.MessageType.Warning)
+
         # Global safety check - prevent any bot operation if game isn't ready
         try:
             if not Map.IsMapReady() or Player.GetAgentID() <= 0:
