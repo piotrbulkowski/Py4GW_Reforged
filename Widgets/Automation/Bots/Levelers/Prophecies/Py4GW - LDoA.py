@@ -2,6 +2,8 @@ from Py4GWCoreLib import*
 import time, Py4GW
 import traceback
 from Py4GWCoreLib import Key,  Map, ImGui, Botting, ActionQueue, Agent
+from Py4GWCoreLib.Builds.Any.HeroAI import HeroAI_Build
+from Py4GWCoreLib.HeroAI.cache_data import CacheData
 from Py4GWCoreLib.enums_src.Region_enums import ServerRegion
 
 
@@ -186,7 +188,10 @@ ascalon_town_exit_coordinate_list = [(7465, 5461)]  # Move closer to exit before
 
 
 foible_coordinate_list = [(344, 7832), (367, 7790)]
-bandit_coordinate_list = [(2312, 5970), (2586,4429)]
+bandit_coordinate_list = [(2312, 5970), (2586,4429),
+                          (2841, 2735), (965, 1954), (-241, 3182), (-991, 3974),
+                          (-2265, 4697)]  # second bandit group (2) at the end
+wizards_folly_to_foible_coordinate_list = [(139, 8343)]  # Wizard's Folly -> Foible's Fair portal
 
 abbeyout_coordinate_list = [(7954, 5862),(7430, 5480),(7410, 5480)]
 abbey_coordinate_list = [(3386, -1112), (-220, -5393), (-3710, -6761), (-6529, -6570), (-11028, -6230), (-11060, -6200)]
@@ -208,6 +213,8 @@ def StartBot():
     global bot_vars, start_time
     bot_vars.bot_started = True
     start_time = time.time()
+    FSM_vars.hamnet_empty_runs = 0
+    FSM_vars.hamnet_needs_portal_entry = True
     # Baseline for the "farmed" column: items gained since START was pressed.
     inventory_tracker.initialize()
 
@@ -386,6 +393,7 @@ def ResetEnvironment():
     FSM_vars.rurik_pathing.reset()
     FSM_vars.foible_pathing.reset()
     FSM_vars.bandit_pathing.reset()
+    FSM_vars.wizards_folly_to_foible_pathing.reset()
     FSM_vars.abbeyout_pathing.reset()
     FSM_vars.abbey_pathing.reset()
     FSM_vars.foibleout_pathing.reset()
@@ -410,6 +418,26 @@ def ResetEnvironment():
     FSM_vars.state_machine_grandtour.reset()
     FSM_vars.movement_handler.reset()
 
+    # Agent IDs are reused in every new map instance, so a target kept from the
+    # previous run can point at an unrelated (possibly friendly) agent.
+    FSM_vars.current_target_id = None
+    FSM_vars.last_target_id = None
+    FSM_vars.has_interacted = False
+    FSM_vars.current_skill_index = 1
+    FSM_vars.hamnet_seen_enemies = False
+    hamnet_heroai.ResetTickExecution()
+    hamnet_travel_timer.Stop()
+    hamnet_action_timer.Stop()
+    hamnet_loot_timer.Stop()
+    hamnet_clear_timer.Stop()
+    FSM_vars.hamnet_final_checkpoint_pathing.reset()
+    FSM_vars.hamnet_loot_agent = 0
+    FSM_vars.hamnet_loot_skipped.clear()  # agent IDs are per map instance
+
+# NOTE: the default player_id is evaluated once at import, while the player's
+# agent ID changes on every map load, so callers relying on the default read a
+# stale ID. Harmless today (early_handle_map_path overwrites the result before
+# using it); pass Player.GetAgentID() explicitly if this value is ever relied on.
 def LDoA_GetPetBehavior(player_id=Player.GetAgentID()):
     PetInfo = Party.Pets.GetPetInfo(player_id)
     return PetInfo.behavior
@@ -566,25 +594,6 @@ def Death():
         # If there's any error getting health info, assume we're not dead
         return False 
 
-def Survivor_Hamnet():
-    try:
-        # Check if game is ready before accessing health data
-        if not Map.IsMapReady() or Player.GetAgentID() <= 0:
-            return False
-            
-        max_health = Agent.GetMaxHealth(Player.GetAgentID())
-        if max_health <= 0:
-            return False  # Can't calculate health percentage if max health is 0 or negative
-        current_health = Agent.GetHealth(Player.GetAgentID()) * max_health
-        current_health_pct = current_health / max_health * 100
-        
-        if current_health_pct < 45:
-            return True  
-        return False
-    except Exception as e:
-        # If there's any error getting health info, assume we're not in danger
-        return False 
-
 #FIGHT FUNCTIONS
 def get_called_target():
     """Get the first called target from party members, if it's alive."""
@@ -665,17 +674,11 @@ def handle_map_path(map_pathing):
 
             return 
 
-def handle_loot():
-    """
-    Function to handle the looting logic separately from the main map handling.
-    """
-    global FSM_vars
-    my_id = Player.GetAgentID()
-    my_x, my_y = Agent.GetXY(my_id)
-    item_distance = 1200
-
+def get_lootable_item_agents(item_distance):
+    """Item agents within item_distance whose item type is looted by this bot, nearest first."""
+    my_xy = Player.GetXY()
     item_array = AgentArray.GetItemArray()
-    item_array = AgentArray.Filter.ByDistance(item_array, (my_x, my_y), item_distance)
+    item_array = AgentArray.Filter.ByDistance(item_array, my_xy, item_distance)
 
     agent_to_item_map = {
         agent_id: Agent.GetItemAgentItemID(agent_id)
@@ -692,7 +695,14 @@ def handle_loot():
         if item_id in filtered_items
     ]
 
-    filtered_agent_ids = AgentArray.Sort.ByDistance(filtered_agent_ids, Agent.GetXY(my_id))
+    return AgentArray.Sort.ByDistance(filtered_agent_ids, my_xy)
+
+def handle_loot():
+    """
+    Function to handle the looting logic separately from the main map handling.
+    """
+    global FSM_vars
+    filtered_agent_ids = get_lootable_item_agents(1200)
 
     if len(filtered_agent_ids) > 0:
         looting_item = filtered_agent_ids[0]
@@ -712,29 +722,7 @@ def handle_lootFlower():
     Function to handle the looting logic separately from the main map handling.
     """
     global FSM_vars
-    my_id = Player.GetAgentID()
-    my_x, my_y = Agent.GetXY(my_id)
-    item_distance = 2500
-
-    item_array = AgentArray.GetItemArray()
-    item_array = AgentArray.Filter.ByDistance(item_array, (my_x, my_y), item_distance)
-
-    agent_to_item_map = {
-        agent_id: Agent.GetItemAgentItemID(agent_id)
-        for agent_id in item_array
-    }
-
-    filtered_items = list(agent_to_item_map.values())
-    filtered_items = ItemArray.Filter.ByCondition(
-        filtered_items, lambda item_id: Item.GetItemType(item_id)[0] in {30, 10, 20, 9}
-    )
-
-    filtered_agent_ids = [
-        agent_id for agent_id, item_id in agent_to_item_map.items()
-        if item_id in filtered_items
-    ]
-
-    filtered_agent_ids = AgentArray.Sort.ByDistance(filtered_agent_ids, Agent.GetXY(my_id))
+    filtered_agent_ids = get_lootable_item_agents(2500)
 
     if len(filtered_agent_ids) > 0:
         looting_item = filtered_agent_ids[0]
@@ -970,6 +958,8 @@ def early_handle_map_path(map_pathing):
     if not enemy_array:
         FSM_vars.current_target_id = None
         FSM_vars.last_target_id = None
+        # NOTE: this sends the pet "Guard" command every frame while no enemy is
+        # in range (not only when the behaviour changes). Rangers only.
         if my_p_prof == 2 or my_s_prof == 2:
             if not FSM_vars.PetBehavior == 1:
                 FSM_vars.PetBehavior = 1 #0=Fight, 1=Guard, 2=Avoid
@@ -1020,7 +1010,7 @@ def early_handle_map_path(map_pathing):
         Party.Pets.SetPetBehavior(1, my_id)
         Routines.Movement.FollowPath(map_pathing, FSM_vars.movement_handler)
 
-#FOR FARMER HAMNET
+#USED BY THE RANGER LEVEL 1 ROUTINE (the Farmer Hamnet 11-20 loop uses hamnet_fight below)
 def hamnet_handle_map_path(map_pathing):
     global FSM_vars
     my_id = Player.GetAgentID()
@@ -1071,6 +1061,249 @@ def hamnet_handle_map_path(map_pathing):
     else:
         Party.Pets.SetPetBehavior(1, my_id)
         Routines.Movement.FollowPath(map_pathing, FSM_vars.movement_handler)
+
+#___________________________ FARMER HAMNET (LEVEL 11-20) ___________________________#
+HAMNET_MAX_LEVEL = 20
+HAMNET_PATH_ENGAGE_RANGE = 1200   # enemies engaged while walking to the bandits
+HAMNET_TRAVEL_RETRY_MS = 20000    # re-request travel if Foible's Fair has not loaded
+HAMNET_EXIT_RETRY_MS = 30000      # re-walk the exit path if the zone line was missed
+HAMNET_PATH_TIMEOUT_MS = 240000   # walking the bandit route (two groups)
+HAMNET_FIGHT_TIMEOUT_MS = 180000  # reaching the last checkpoint and clearing it
+HAMNET_CLEAR_CONFIRM_MS = 3000    # area must stay empty this long before the run ends
+HAMNET_MAX_EMPTY_RUNS = 2         # consecutive runs without enemies -> quest not active
+HAMNET_RESIGN_TIMEOUT_MS = 20000  # give up on /resign and map travel instead
+HAMNET_LOOT_RANGE = 1200          # drops picked up while walking the bandit route
+HAMNET_PICKUP_TIMEOUT_MS = 8000   # skip a drop that could not be picked up in time
+
+# Skills are cast by HeroAI and follow this account's HeroAI options (Combat and
+# the per-skill toggles in the HeroAI panel). Do not also let the HeroAI widget
+# fight for this character, or both will drive the same skill bar.
+hamnet_cached_data = CacheData()
+hamnet_heroai = HeroAI_Build(hamnet_cached_data, standalone_fallback=True)
+hamnet_travel_timer = Timer()
+hamnet_state_timer = Timer()
+hamnet_action_timer = Timer()  # throttles /resign and return-to-outpost requests
+hamnet_loot_timer = Timer()    # time spent on the current pickup
+hamnet_clear_timer = Timer()   # how long the last checkpoint has been free of enemies
+
+def hamnet_log(message, message_type=PySystem.Console.MessageType.Info):
+    PySystem.Console.Log(module_name, f"[HAMNET] {message}", message_type)
+
+def hamnet_enemies_in_range(distance):
+    player_xy = Player.GetXY()
+    enemy_array = AgentArray.GetEnemyArray()
+    enemy_array = AgentArray.Filter.ByDistance(enemy_array, player_xy, distance)
+    enemy_array = AgentArray.Filter.ByAttribute(enemy_array, 'IsAlive')
+    return AgentArray.Sort.ByDistance(enemy_array, player_xy)
+
+def hamnet_heroai_combat_enabled():
+    options = hamnet_cached_data.account_options
+    return options is not None and bool(options.Combat)
+
+def hamnet_heroai_busy():
+    """Same casting gate as the HeroAI widget (CastingBlockNode). HeroAI only *queues* a cast
+    on the shared ACTION queue; until it starts, the skill is neither recharging nor casting,
+    so ticking every frame would queue the same cast again and again - and by the time the
+    queue runs them the target is often dead ("invalid spell target")."""
+    return hamnet_cached_data.combat_handler.InCastingRoutine() or Agent.IsCasting(Player.GetAgentID())
+
+def hamnet_set_pet_behavior(behavior, lock_target_id):
+    """Rangers only. Guard (1) is sent only on change; Fight (0) is sent per new target to lock it."""
+    my_p_prof, my_s_prof = Agent.GetProfessionIDs(Player.GetAgentID())
+    if Profession.Ranger.value not in (my_p_prof, my_s_prof):
+        return
+    if FSM_vars.PetBehavior != behavior or behavior == 0:
+        Party.Pets.SetPetBehavior(behavior, lock_target_id)
+        FSM_vars.PetBehavior = behavior
+
+hamnet_travel_attempts = 0
+
+def hamnet_travel_to_foible():
+    """Stop at the level cap; otherwise travel to Foible's Fair in an allowed Europe district,
+    retrying if travel did not happen. Retries alternate Polish / English, in case one is unavailable."""
+    global hamnet_travel_attempts
+    if Agent.GetLevel(Player.GetAgentID()) >= HAMNET_MAX_LEVEL:
+        hamnet_log(f"Level {HAMNET_MAX_LEVEL} reached - stopping.", PySystem.Console.MessageType.Success)
+        StopBot()
+        return
+    if hamnet_in_foible_district():
+        hamnet_travel_timer.Stop()
+        hamnet_travel_attempts = 0
+        return
+    if not Map.IsMapReady():
+        return  # never request travel during a loading screen
+    if hamnet_travel_timer.IsStopped() or hamnet_travel_timer.HasElapsed(HAMNET_TRAVEL_RETRY_MS):
+        if not hamnet_travel_timer.IsStopped():
+            hamnet_log("Still not in Foible's Fair (Europe Polish/English) - requesting travel again.", PySystem.Console.MessageType.Warning)
+        use_fallback = hamnet_travel_attempts % 2 == 1
+        hamnet_log(f"Traveling to Foible's Fair - Europe {'English' if use_fallback else 'Polish'}.")
+        LDoA_TravelToOutpost(bot_vars.foible_map, use_fallback_district=use_fallback)
+        hamnet_travel_attempts += 1
+        hamnet_travel_timer.Start()
+        FSM_vars.hamnet_needs_portal_entry = True  # travel spawns away from the portal
+
+def hamnet_in_foible():
+    return Map.IsMapReady() and Map.GetMapID() == bot_vars.foible_map and Party.IsPartyLoaded()
+
+def hamnet_in_foible_district():
+    return hamnet_in_foible() and LDoA_InAllowedDistrict()
+
+def hamnet_in_explorable():
+    return Map.IsMapReady() and Map.IsExplorable() and Party.IsPartyLoaded()
+
+def hamnet_walk_through_portal(map_pathing):
+    """Walk map_pathing into a zone line; re-walk it if the zone line was missed."""
+    if hamnet_state_timer.HasElapsed(HAMNET_EXIT_RETRY_MS):
+        hamnet_log("Zone line missed - walking the path again.", PySystem.Console.MessageType.Warning)
+        map_pathing.reset()
+        FSM_vars.movement_handler.reset()
+        hamnet_state_timer.Start()
+    Routines.Movement.FollowPath(map_pathing, FSM_vars.movement_handler)
+
+def hamnet_start_walk(map_pathing):
+    map_pathing.reset()
+    FSM_vars.movement_handler.reset()
+    hamnet_state_timer.Start()
+
+def hamnet_player_dead():
+    return Map.IsExplorable() and Agent.IsDead(Player.GetAgentID())
+
+def hamnet_begin_run_end():
+    """Every run ends by /resign (or plain return to outpost if already defeated)."""
+    FSM_vars.hamnet_resign = Map.IsExplorable()
+    hamnet_action_timer.Stop()
+    hamnet_state_timer.Start()
+
+def hamnet_resign_and_return():
+    """/resign, then return to outpost once the party is defeated (back to Foible's Fair, next to the portal)."""
+    if not FSM_vars.hamnet_resign:
+        return
+    if not Map.IsExplorable():
+        # In a town that is not Foible's Fair (e.g. after a reconnect): nothing to resign,
+        # let the state exit so the next run travels.
+        if Map.IsMapReady() and Map.GetMapID() != bot_vars.foible_map:
+            FSM_vars.hamnet_resign = False
+        return
+    if Party.IsPartyDefeated():
+        if hamnet_action_timer.IsStopped() or hamnet_action_timer.HasElapsed(3000):
+            Party.ReturnToOutpost()
+            hamnet_action_timer.Start()
+        return
+    if hamnet_state_timer.HasElapsed(HAMNET_RESIGN_TIMEOUT_MS):
+        hamnet_log("Resign did not defeat the party - falling back to map travel.", PySystem.Console.MessageType.Warning)
+        FSM_vars.hamnet_resign = False  # state exits; the next run's first state travels
+        return
+    if hamnet_action_timer.IsStopped() or hamnet_action_timer.HasElapsed(5000):
+        Player.SendChatCommand("resign")
+        hamnet_action_timer.Start()
+
+def hamnet_loot():
+    """Pick up the nearest wanted drop. Returns True while a pickup is in progress; the
+    caller must not issue movement then, or the pickup walk and the path keep overriding
+    each other (back-and-forth)."""
+    candidates = [agent_id for agent_id in get_lootable_item_agents(HAMNET_LOOT_RANGE)
+                  if agent_id not in FSM_vars.hamnet_loot_skipped]
+    if not candidates:
+        FSM_vars.hamnet_loot_agent = 0
+        return False
+
+    item_agent = candidates[0]
+    if item_agent != FSM_vars.hamnet_loot_agent:
+        FSM_vars.hamnet_loot_agent = item_agent
+        FSM_vars.hamnet_loot_last_interact = 0.0
+        hamnet_loot_timer.Start()
+
+    if hamnet_loot_timer.HasElapsed(HAMNET_PICKUP_TIMEOUT_MS):
+        hamnet_log(f"Could not pick up item agent {item_agent} - skipping it.", PySystem.Console.MessageType.Warning)
+        FSM_vars.hamnet_loot_skipped.add(item_agent)
+        FSM_vars.hamnet_loot_agent = 0
+        return False
+
+    if time.time() - FSM_vars.hamnet_loot_last_interact >= 1.5:
+        Player.Interact(item_agent, call_target=False)  # walks to the item and picks it up
+        FSM_vars.hamnet_loot_last_interact = time.time()
+    return True
+
+def hamnet_fight(engage_range, map_pathing=None):
+    """Fight live enemies within engage_range; otherwise loot and keep following map_pathing."""
+    enemies = hamnet_enemies_in_range(engage_range)
+    if not enemies:
+        FSM_vars.current_target_id = None
+        hamnet_set_pet_behavior(1, Player.GetAgentID())
+        if hamnet_heroai_combat_enabled() and not hamnet_heroai_busy():
+            next(hamnet_heroai.Tick(is_in_combat=False), None)  # out-of-combat heals/buffs
+        if map_pathing is not None and not hamnet_loot():
+            Routines.Movement.FollowPath(map_pathing, FSM_vars.movement_handler)
+        return
+
+    FSM_vars.hamnet_seen_enemies = True
+    FSM_vars.hamnet_loot_agent = 0
+    is_casting = Agent.IsCasting(Player.GetAgentID())
+    game_target = Player.GetTargetID()
+    # Follow HeroAI's own choice while it is a live enemy in range; otherwise keep ours
+    # while it is still alive, else take the nearest.
+    if game_target in enemies:
+        FSM_vars.current_target_id = game_target
+    elif FSM_vars.current_target_id not in enemies:
+        FSM_vars.current_target_id = enemies[0]
+
+    # The game target is dead or wrong (e.g. it died mid-cast). With HeroAI Targeting off,
+    # skills are cast at the game target, so fix it first and skip casting this frame:
+    # the target change is not visible to HeroAI until the next frame.
+    if game_target != FSM_vars.current_target_id:
+        if not is_casting and time.time() - FSM_vars.last_skill_time >= 0.5:
+            Player.ChangeTarget(FSM_vars.current_target_id)
+            Player.Interact(FSM_vars.current_target_id, call_target=False)
+            FSM_vars.last_skill_time = time.time()
+            hamnet_set_pet_behavior(0, FSM_vars.current_target_id)
+        return
+
+    if hamnet_heroai_combat_enabled():
+        if not hamnet_heroai_busy():
+            next(hamnet_heroai.Tick(is_in_combat=True), None)
+        return  # HeroAI owns skills and auto-attack for this account.
+
+    # HeroAI combat is off for this account: at least keep auto-attacking.
+    if not is_casting and time.time() - FSM_vars.last_skill_time >= 2.0:
+        Player.Interact(FSM_vars.current_target_id, call_target=False)
+        FSM_vars.last_skill_time = time.time()
+
+def hamnet_path_done():
+    if hamnet_state_timer.HasElapsed(HAMNET_PATH_TIMEOUT_MS):
+        hamnet_log("Walking to the bandits timed out - moving on.", PySystem.Console.MessageType.Warning)
+        return True
+    return (Routines.Movement.IsFollowPathFinished(FSM_vars.bandit_pathing, FSM_vars.movement_handler)
+            and not hamnet_enemies_in_range(HAMNET_PATH_ENGAGE_RANGE))
+
+def hamnet_fight_done():
+    """The last checkpoint is reached, nothing is left to loot, and no enemy has been in range for a few seconds."""
+    if hamnet_state_timer.HasElapsed(HAMNET_FIGHT_TIMEOUT_MS):
+        hamnet_log("Fight timed out - ending the run.", PySystem.Console.MessageType.Warning)
+        return True
+    if (hamnet_enemies_in_range(area_distance.Area_1)
+            or FSM_vars.hamnet_loot_agent
+            or not Routines.Movement.IsFollowPathFinished(FSM_vars.hamnet_final_checkpoint_pathing, FSM_vars.movement_handler)):
+        hamnet_clear_timer.Stop()
+        return False
+    if hamnet_clear_timer.IsStopped():
+        hamnet_clear_timer.Start()  # a bandit briefly out of range must not end the run
+        return False
+    if hamnet_clear_timer.HasElapsed(HAMNET_CLEAR_CONFIRM_MS):
+        hamnet_log("Last checkpoint clear.")
+        return True
+    return False
+
+def hamnet_end_of_run():
+    """Called when one Hamnet run has finished: track empty runs, then restart or stop."""
+    if FSM_vars.hamnet_seen_enemies:
+        FSM_vars.hamnet_empty_runs = 0
+    else:
+        FSM_vars.hamnet_empty_runs += 1
+        hamnet_log(f"No enemies found this run ({FSM_vars.hamnet_empty_runs}/{HAMNET_MAX_EMPTY_RUNS}).", PySystem.Console.MessageType.Warning)
+    ResetEnvironment()
+    if FSM_vars.hamnet_empty_runs >= HAMNET_MAX_EMPTY_RUNS:
+        hamnet_log("No bandits on consecutive runs - is the Farmer Hamnet quest active? Stopping.", PySystem.Console.MessageType.Error)
+        StopBot()
 
 def handle_npc_interaction():
     global FSM_vars
@@ -1661,6 +1894,19 @@ class StateMachineVars:
         self.state_machine_lvl11_20 = FSM("LEVEL 11-20")
         self.foible_pathing = Routines.Movement.PathHandler(foible_coordinate_list)
         self.bandit_pathing = Routines.Movement.PathHandler(bandit_coordinate_list)
+        self.hamnet_seen_enemies = False  # any enemy engaged during the current run
+        self.hamnet_empty_runs = 0        # consecutive runs without enemies
+        # Entering Foible's Fair through the Wizard's Folly portal makes "return to
+        # outpost" spawn us next to that portal. Needed on the first run and after
+        # any map travel (travel spawns at the default outpost spawn instead).
+        self.hamnet_needs_portal_entry = True
+        self.hamnet_resign = False        # end this run by /resign + return to outpost
+        self.hamnet_loot_agent = 0        # item agent currently being picked up
+        self.hamnet_loot_last_interact = 0.0
+        self.hamnet_loot_skipped = set()  # item agents given up on this run
+        self.wizards_folly_to_foible_pathing = Routines.Movement.PathHandler(wizards_folly_to_foible_coordinate_list)
+        # The final fight walks (back) to the last bandit checkpoint before it may end.
+        self.hamnet_final_checkpoint_pathing = Routines.Movement.PathHandler(bandit_coordinate_list[-1:])
 
         #FSM for DULL CARAPACES
         self.state_machine_dull_carapaces = FSM("DULL CARAPACES")
@@ -2094,13 +2340,20 @@ FSM_vars.state_machine_ResetQuest.AddState(name="CHECK NPC", execute_fn=lambda: 
 FSM_vars.state_machine_ResetQuest.AddState(name="TAKING QUEST", execute_fn=lambda: Player.SendDialog(int("0x802E01", 16)), transition_delay_ms=1500, run_once=True)
 
 #___________________________ FARMER HAMNET ___________________________#
-FSM_vars.state_machine_lvl11_20.AddState(name="GOING BACK TO ASCALON", execute_fn=lambda: LDoA_TravelToOutpost(bot_vars.foible_map), exit_condition=lambda: Map.GetMapID() == bot_vars.foible_map or Map.IsMapReady() and LDoA_IsOutpost() and Party.IsPartyLoaded(), transition_delay_ms=3000, run_once=True)
-FSM_vars.state_machine_lvl11_20.AddState(name="WAITING OUTPOST MAP", exit_condition=lambda: Map.IsMapReady() and LDoA_IsOutpost() and Party.IsPartyLoaded(), transition_delay_ms=5000, run_once=True)
-FSM_vars.state_machine_lvl11_20.AddState(name="GOING OUT IN DANGEROUS LANDS", execute_fn=lambda: Routines.Movement.FollowPath(FSM_vars.foible_pathing, FSM_vars.movement_handler), exit_condition=lambda: Routines.Movement.IsFollowPathFinished(FSM_vars.foible_pathing, FSM_vars.movement_handler) or (Map.IsMapReady() and Map.IsExplorable() and Party.IsPartyLoaded()), run_once=False)
-FSM_vars.state_machine_lvl11_20.AddState(name="WAITING EXPLORABLE MAP", exit_condition=lambda: Map.IsMapReady() and Map.IsExplorable() and Party.IsPartyLoaded(), transition_delay_ms=3000, run_once=True)
+FSM_vars.state_machine_lvl11_20.AddState(name="GOING BACK TO FOIBLE'S FAIR", execute_fn=lambda: hamnet_travel_to_foible(), exit_condition=lambda: hamnet_in_foible_district(), transition_delay_ms=3000, run_once=False)
+FSM_vars.state_machine_lvl11_20.AddState(name="WAITING OUTPOST MAP", exit_condition=lambda: hamnet_in_foible(), transition_delay_ms=5000, run_once=True)
+FSM_vars.state_machine_lvl11_20.AddState(name="GOING OUT IN DANGEROUS LANDS", execute_fn=lambda: hamnet_walk_through_portal(FSM_vars.foible_pathing), exit_condition=lambda: hamnet_in_explorable(), run_once=False, on_enter=lambda: hamnet_start_walk(FSM_vars.foible_pathing))
+# Portal entry (first run, and after any map travel): Wizard's Folly -> Foible's Fair -> out again,
+# so that the /resign + return to outpost at the end of each run spawns next to the exit portal.
+FSM_vars.state_machine_lvl11_20.AddState(name="ENTERING FOIBLE'S FAIR THROUGH THE PORTAL", execute_fn=lambda: FSM_vars.hamnet_needs_portal_entry and hamnet_walk_through_portal(FSM_vars.wizards_folly_to_foible_pathing), exit_condition=lambda: not FSM_vars.hamnet_needs_portal_entry or hamnet_in_foible(), run_once=False, on_enter=lambda: hamnet_start_walk(FSM_vars.wizards_folly_to_foible_pathing))
+FSM_vars.state_machine_lvl11_20.AddState(name="GOING OUT AGAIN", execute_fn=lambda: FSM_vars.hamnet_needs_portal_entry and hamnet_walk_through_portal(FSM_vars.foible_pathing), exit_condition=lambda: hamnet_in_explorable(), run_once=False, on_enter=lambda: hamnet_start_walk(FSM_vars.foible_pathing), on_exit=lambda: setattr(FSM_vars, "hamnet_needs_portal_entry", False))
+FSM_vars.state_machine_lvl11_20.AddState(name="WAITING EXPLORABLE MAP", exit_condition=lambda: hamnet_in_explorable(), transition_delay_ms=3000, run_once=True)
 FSM_vars.state_machine_lvl11_20.AddState(name="USING IMP STONE", execute_fn=lambda: useitem(30847), run_once=True)
-FSM_vars.state_machine_lvl11_20.AddState(name="LUCKILY THERE IS A PRIEST", execute_fn=lambda: early_handle_map_path(FSM_vars.bandit_pathing), exit_condition=lambda: Routines.Movement.IsFollowPathFinished(FSM_vars.bandit_pathing, FSM_vars.movement_handler) or Survivor_Hamnet(), run_once=False)
-FSM_vars.state_machine_lvl11_20.AddState(name="FIRE IMP IS FIRING", execute_fn=lambda: set_killing_routine(), exit_condition=lambda: end_killing_routine() or Survivor_Hamnet(), run_once=False)
+FSM_vars.state_machine_lvl11_20.AddState(name="LUCKILY THERE IS A PRIEST", execute_fn=lambda: hamnet_fight(HAMNET_PATH_ENGAGE_RANGE, FSM_vars.bandit_pathing), exit_condition=lambda: hamnet_path_done() or hamnet_player_dead(), run_once=False, on_enter=lambda: hamnet_state_timer.Start())
+# Final fight: walk to the last checkpoint (also after a route timeout), clear it, loot, and end
+# only once the area has stayed empty for HAMNET_CLEAR_CONFIRM_MS.
+FSM_vars.state_machine_lvl11_20.AddState(name="FIRE IMP IS FIRING", execute_fn=lambda: hamnet_fight(area_distance.Area_1, FSM_vars.hamnet_final_checkpoint_pathing), exit_condition=lambda: hamnet_fight_done() or hamnet_player_dead(), run_once=False, on_enter=lambda: (hamnet_start_walk(FSM_vars.hamnet_final_checkpoint_pathing), hamnet_clear_timer.Stop()))
+FSM_vars.state_machine_lvl11_20.AddState(name="RESIGN AND RETURN TO FOIBLE'S FAIR", execute_fn=lambda: hamnet_resign_and_return(), exit_condition=lambda: hamnet_in_foible() or not FSM_vars.hamnet_resign, run_once=False, on_enter=lambda: hamnet_begin_run_end())
 FSM_vars.state_machine_lvl11_20.AddState(name="COUNTER", execute_fn=lambda: increment_run_counter(), exit_condition=lambda: Party.IsPartyLoaded() and Map.IsMapReady(), transition_delay_ms=1000, run_once=True)
 
 #___________________________ TAME PET ___________________________#
@@ -3091,7 +3344,7 @@ def DrawWindow():
                     PyImGui.text_wrapped("WITH THIS FUNCTION, THE BOT WILL LEAVE ASCALON USING THE 'CHARR AT THE GATE' QUEST, FOLLOW RURIK, AND WAIT FOR THE PRINCE TO KILL THREE CHARR BEFORE RETURNING TO THE CITY AND RESTARTING THE LOOP. THIS FUNCTION ENSURES SURVIVOR TITLE PROGRESSION.")
                     state.radio_button_selected = PyImGui.radio_button(" \uf443 LEVEL 2-10 - CHARR AT THE GATE", state.radio_button_selected, 0)
                     PyImGui.spacing()
-                    PyImGui.text_wrapped("ONCE YOU REACH LEVEL 10, WAIT FOR THE ROTATION OF THE VANGUARD QUESTS UNTIL THE 'FARMER HAMNET' QUEST BECOMES AVAILABLE. THE BOT WILL KILL THE FIRST TWO MOBS OUTSIDE FOIBLE'S FAIR AND REPEAT THE LOOP UNTIL LEVEL 20. THIS FUNCTION ENSURES SURVIVOR TITLE PROGRESSION.")
+                    PyImGui.text_wrapped("ONCE YOU REACH LEVEL 10, WAIT FOR THE ROTATION OF THE VANGUARD QUESTS UNTIL THE 'FARMER HAMNET' QUEST BECOMES AVAILABLE. THE BOT WILL KILL TWO BANDIT GROUPS OUTSIDE FOIBLE'S FAIR, RESIGN, AND REPEAT THE LOOP UNTIL LEVEL 20.")
                     state.radio_button_selected = PyImGui.radio_button(" \uf43f LEVEL 11-20 - FARMER HAMNET", state.radio_button_selected, 1) 
                     PyImGui.spacing()
                     if IsBotStarted():        
@@ -3307,9 +3560,9 @@ def main():
                     FSM_vars.state_machine_elementalist.update() 
 
             # LEVEL 11-20       
-            elif state.radio_button_selected == 1:  
+            elif state.radio_button_selected == 1:
                 if FSM_vars.state_machine_lvl11_20.is_finished():
-                    ResetEnvironment()
+                    hamnet_end_of_run()
                 else:
                     FSM_vars.state_machine_lvl11_20.update()
                     
