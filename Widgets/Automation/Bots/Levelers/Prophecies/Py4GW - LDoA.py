@@ -2,6 +2,7 @@ from Py4GWCoreLib import*
 import time, Py4GW
 import traceback
 from Py4GWCoreLib import Key,  Map, ImGui, Botting, ActionQueue, Agent
+from Py4GWCoreLib.enums_src.Region_enums import ServerRegion
 
 
 #VARIABLES
@@ -428,13 +429,17 @@ def LDoA_IsOutpost():
         return True
     return False
 
-def LDoA_TravelToOutpost(map_id=148):
-    if not Map.GetMapID() == map_id:
-        Map.Travel(map_id)
+# The bot only travels to Europe districts: Polish preferred, English as the fallback.
+LDOA_ALLOWED_LANGUAGES = (ServerLanguage.Polish.value, ServerLanguage.English.value)
 
-def LDoA_TravelToDistrict(map_id=148, district=0, district_number=0):
-    if not Map.GetDistrict() == district or not Map.GetMapID() == map_id:
-        Map.TravelToDistrict(map_id, district, district_number)
+def LDoA_InAllowedDistrict():
+    return Map.GetRegion()[0] == ServerRegion.Europe.value and Map.GetLanguage()[0] in LDOA_ALLOWED_LANGUAGES
+
+def LDoA_TravelToOutpost(map_id=148, use_fallback_district=False):
+    if Map.GetMapID() == map_id and LDoA_InAllowedDistrict():
+        return
+    district = District.EuropeEnglish if use_fallback_district else District.EuropePolish
+    Map.TravelToDistrict(map_id, district.value, 0)
 
 #ITEMS FUNCTIONS   
 def useitem(model_id):
@@ -2369,7 +2374,7 @@ FSM_vars.state_machine_necro_noreq.AddState(name="GOING BACK TO ASCALON", execut
 
 #DULL CARAPACES
 FSM_vars.state_machine_dull_carapaces.AddState(name="ASCALON", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - DULL CARAPACES FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.ascalon_map,6,0)) if not Map.IsExplorable() else None,  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - DULL CARAPACES FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.ascalon_map)) if not Map.IsExplorable() else None,  
                        exit_condition=lambda: LDoA_IsOutpost() or Map.IsExplorable(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2415,7 +2420,7 @@ FSM_vars.state_machine_dull_carapaces.AddState(name="WAITING OUTPOST MAP",
 )
 #GARGOYLE SKULLS
 FSM_vars.state_machine_gargoyle_skulls.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - GARGOYLE SKULLS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.barradin_map,6,0)) if not Map.IsExplorable() else None,  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - GARGOYLE SKULLS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.barradin_map)) if not Map.IsExplorable() else None,  
                        exit_condition=lambda: LDoA_IsOutpost() or Map.IsExplorable(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2458,7 +2463,7 @@ FSM_vars.state_machine_gargoyle_skulls.AddState(name="COUNTER",
 
 #GRAWL NECKLACES
 FSM_vars.state_machine_grawl_necklaces.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - GRAWL NECKLACES FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.barradin_map,6,0)) if not Map.IsExplorable() else None,  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - GRAWL NECKLACES FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.barradin_map)) if not Map.IsExplorable() else None,  
                        exit_condition=lambda: LDoA_IsOutpost() or Map.IsExplorable(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2500,7 +2505,7 @@ FSM_vars.state_machine_grawl_necklaces.AddState(name="WAITING OUTPOST MAP",
 )
 #ICY LODESTONES
 FSM_vars.state_machine_icy_lodestones.AddState(name="ARE WE IN HOGWARTS?", 
-                       execute_fn=lambda: Map.Travel(bot_vars.foible_map),
+                       execute_fn=lambda: LDoA_TravelToOutpost(bot_vars.foible_map),
                        exit_condition=lambda: LDoA_IsOutpost(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2532,7 +2537,7 @@ FSM_vars.state_machine_icy_lodestones.AddState(name="COUNTER",
 
 #ENCHANTED LODESTONES
 FSM_vars.state_machine_lodestone.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - ENCHANTED LODESTONE FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.barradin_map,6,0)) if not Map.IsExplorable() else None,  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - ENCHANTED LODESTONE FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.barradin_map)) if not Map.IsExplorable() else None,  
                        exit_condition=lambda: LDoA_IsOutpost() or Map.IsExplorable(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2557,7 +2562,7 @@ FSM_vars.state_machine_lodestone.AddState(name="FARMING LODESTONES",
 
 #RED IRIS FLOWERS
 FSM_vars.state_machine_red_iris_flowers.AddState(name="ARE WE IN ASCALON?", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - RED IRIS FLOWERS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.ascalon_map,6,0)) if not Map.IsExplorable() else None,                                             
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - RED IRIS FLOWERS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.ascalon_map)) if not Map.IsExplorable() else None,                                             
                        exit_condition=lambda: LDoA_IsOutpost() or Map.IsExplorable(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2614,7 +2619,7 @@ FSM_vars.state_machine_red_iris_flowers.AddState(name="COUNTER",
 
 #SKELETAL LIMBS
 FSM_vars.state_machine_skele_limbs.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - SKELETAL LIMBS", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.barradin_map,6,0)),  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - SKELETAL LIMBS", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.barradin_map)),  
                        exit_condition=lambda: LDoA_IsOutpost(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2652,7 +2657,7 @@ FSM_vars.state_machine_skele_limbs.AddState(name="FARMING LODESTONES",
 
 #SKALE FINS
 FSM_vars.state_machine_skale_fin.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - SKALE FIN FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.ranik_map,6,0)),  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - SKALE FIN FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.ranik_map)),  
                        exit_condition=lambda: LDoA_IsOutpost(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2697,7 +2702,7 @@ FSM_vars.state_machine_skale_fin.AddState(
 
 #SPIDER LEGS
 FSM_vars.state_machine_spider_leg.AddState(name="FORT RANIK", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - SPIDER LEGS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.ranik_map,6,0)),  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - SPIDER LEGS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.ranik_map)),  
                        exit_condition=lambda: LDoA_IsOutpost(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2760,7 +2765,7 @@ FSM_vars.state_machine_spider_leg.AddState(name="FARMING SPIDER LEGS",
 
 #UNNATURAL SEEDS
 FSM_vars.state_machine_unnatural_seeds.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - UNNATURAL SEEDS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.barradin_map,6,0)),  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - UNNATURAL SEEDS FARM", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.barradin_map)),  
                        exit_condition=lambda: LDoA_IsOutpost(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2785,7 +2790,7 @@ FSM_vars.state_machine_unnatural_seeds.AddState(name="FARMING LODESTONES",
 
 #WORN BELTS
 FSM_vars.state_machine_worn_belts.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - WORN BELTS", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.barradin_map,6,0)),  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - WORN BELTS", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.barradin_map)),  
                        exit_condition=lambda: LDoA_IsOutpost(),
                        transition_delay_ms=1000,
                        run_once=True)
@@ -2847,7 +2852,7 @@ FSM_vars.state_machine_baked_husks.AddState(name="COUNTER",
 
 #CHARR GATE OPENER
 FSM_vars.state_machine_charr_gate_opener.AddState(name="ASCALON", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - CHARR GATE OPENER", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.ascalon_map,6,0)) if not Map.IsExplorable() else None,  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO - CHARR GATE OPENER", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.ascalon_map)) if not Map.IsExplorable() else None,  
                        exit_condition=lambda: LDoA_IsOutpost() or Map.IsExplorable(),
                        transition_delay_ms=2000,
                        run_once=True)
@@ -2888,7 +2893,7 @@ FSM_vars.state_machine_charr_gate_opener.AddState(name="WAITING YOUR SLOW PC TO 
 
 #NICHOLAS SANDFORD
 FSM_vars.state_machine_nicholas_sandford.AddState(name="BARRADIN", 
-                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO -  GOING TO NICHOLAS SANDFORD", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToDistrict(bot_vars.ranik_map,6,0)),  
+                       execute_fn=lambda: (PySystem.Console.Log("TH3KUM1KO -  GOING TO NICHOLAS SANDFORD", "MOVING TO A SAFER DISTRICT", PySystem.Console.MessageType.Info),LDoA_TravelToOutpost(bot_vars.ranik_map)),  
                        exit_condition=lambda: LDoA_IsOutpost(),
                        transition_delay_ms=1000,
                        run_once=True)
